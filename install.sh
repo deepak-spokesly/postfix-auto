@@ -1,132 +1,141 @@
 #!/bin/bash
-# Multi-IP Postfix + Dovecot + Roundcube + PostfixAdmin with Live Stats
-# For Ubuntu 24.04
+# Postfix + Dovecot + DKIM + DMARC + BIND9 + SSL + Roundcube + PostfixAdmin
+# Ubuntu 24.04 LTS
+# Run as root
 
-set -e
+# === CONFIGURATION ===
+DOMAIN="example.com"
+SUBDOMAINS=("mail1" "mail2" "mail3")
+IPS=("192.0.2.10" "192.0.2.11" "192.0.2.12")
+EMAIL="admin@$DOMAIN"
+WEBMAIL="webmail.$DOMAIN"
+ADMINPANEL="mailadmin.$DOMAIN"
 
-### CONFIGURATION ###
-DOMAIN="au-newsletters.com"
-SUBDOMAINS=("ca01" "ca02" "ca03" "ca04" "ca05" "ca06" "ca07" "ca08" "ca09" "ca10")   # one-to-one with IPS below
-IPS=("54.39.78.214" "54.39.78.219" "54.39.78.221" "54.39.78.222" "15.235.122.20" "15.235.122.21" "15.235.122.22" "15.235.122.23" "15.235.122.24" "15.235.122.72")
-ADMIN_EMAIL="au-newsletters.com"
-DB_PASS="StrongPass123"
+# === PREPARE SYSTEM ===
+apt update -y && apt upgrade -y
+DEBIAN_FRONTEND=noninteractive apt install -y postfix mailutils postfwd opendkim opendkim-tools opendmarc bind9 bind9utils bind9-dnsutils certbot dovecot-imapd dovecot-pop3d dovecot-lmtpd mariadb-server nginx php-fpm php-mysql php-intl php-mbstring php-xml unzip wget git
 
-### Update & install dependencies ###
-apt update && apt upgrade -y
-apt install -y postfix postfix-policyd-spf-python dovecot-imapd dovecot-pop3d \
- dovecot-mysql mariadb-server mariadb-client \
- php php-mysql php-intl php-xml php-cli php-mbstring php-curl \
- apache2 libapache2-mod-php certbot python3-certbot-apache \
- git composer unzip pflogsumm mailutils bind9 bind9utils
-
-### Configure MySQL ###
-mysql -e "CREATE DATABASE postfixadmin;"
-mysql -e "CREATE USER 'postfixadmin'@'localhost' IDENTIFIED BY '${DB_PASS}';"
-mysql -e "GRANT ALL PRIVILEGES ON postfixadmin.* TO 'postfixadmin'@'localhost';"
+# === DATABASE SETUP ===
+mysql -e "CREATE DATABASE mailserver;"
+mysql -e "CREATE USER 'mailuser'@'localhost' IDENTIFIED BY 'mailpass';"
+mysql -e "GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'localhost';"
 mysql -e "FLUSH PRIVILEGES;"
 
-### Install PostfixAdmin ###
-cd /var/www
-git clone https://github.com/postfixadmin/postfixadmin.git
-cd postfixadmin
-composer install --no-dev
-chown -R www-data:www-data /var/www/postfixadmin
+# === POSTFIXADMIN INSTALL ===
+cd /var/www/
+wget https://github.com/postfixadmin/postfixadmin/archive/refs/tags/postfixadmin-3.3.13.tar.gz
+tar xzf postfixadmin-*.tar.gz
+mv postfixadmin-* postfixadmin
+chown -R www-data:www-data postfixadmin
 
-### Apache config for PostfixAdmin ###
-cat > /etc/apache2/sites-available/postfixadmin.conf <<EOF
-<VirtualHost *:80>
-    ServerName mail.${DOMAIN}
-    DocumentRoot /var/www/postfixadmin/public
-
-    <Directory /var/www/postfixadmin/public>
-        AllowOverride All
-        Require all granted
-    </Directory>
-</VirtualHost>
+# Config
+cp /var/www/postfixadmin/config.local.php /var/www/postfixadmin/config.local.php.bak || true
+cat > /var/www/postfixadmin/config.local.php <<EOF
+<?php
+\$CONF['configured'] = true;
+\$CONF['setup_password'] = '$(php -r "echo password_hash('setup123', PASSWORD_DEFAULT);")';
+\$CONF['default_language'] = 'en';
+\$CONF['database_type'] = 'mysqli';
+\$CONF['database_host'] = 'localhost';
+\$CONF['database_user'] = 'mailuser';
+\$CONF['database_password'] = 'mailpass';
+\$CONF['database_name'] = 'mailserver';
+\$CONF['domain_path'] = 'NO';
+\$CONF['domain_in_mailbox'] = 'YES';
+\$CONF['encrypt'] = 'dovecot:SHA512-CRYPT';
+\$CONF['dovecotpw'] = "/usr/bin/doveadm pw";
+\$CONF['admin_email'] = '$EMAIL';
 EOF
 
-a2ensite postfixadmin.conf
-a2enmod rewrite ssl
-systemctl reload apache2
+# Nginx vhost
+cat > /etc/nginx/sites-available/postfixadmin.conf <<EOF
+server {
+    listen 80;
+    server_name $ADMINPANEL;
+    root /var/www/postfixadmin/public;
 
-### Install Roundcube ###
-cd /var/www
-wget https://github.com/roundcube/roundcubemail/releases/download/1.6.9/roundcubemail-1.6.9-complete.tar.gz
-tar -xvzf roundcubemail-1.6.9-complete.tar.gz
-mv roundcubemail-1.6.9 roundcube
-chown -R www-data:www-data /var/www/roundcube
-rm roundcubemail-1.6.9-complete.tar.gz
+    location / {
+        index index.php;
+    }
 
-### Apache config for Roundcube ###
-cat > /etc/apache2/sites-available/roundcube.conf <<EOF
-<VirtualHost *:80>
-    ServerName webmail.${DOMAIN}
-    DocumentRoot /var/www/roundcube
-
-    <Directory /var/www/roundcube>
-        AllowOverride All
-        Require all granted
-    </Directory>
-</VirtualHost>
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
+    }
+}
 EOF
 
-a2ensite roundcube.conf
-systemctl reload apache2
+ln -s /etc/nginx/sites-available/postfixadmin.conf /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
 
-### SSL for all subdomains ###
-for SUB in "${SUBDOMAINS[@]}"; do
-  certbot --apache -d ${SUB}.${DOMAIN} -m ${ADMIN_EMAIL} --agree-tos --non-interactive
-done
-certbot --apache -d mail.${DOMAIN} -m ${ADMIN_EMAIL} --agree-tos --non-interactive
-certbot --apache -d webmail.${DOMAIN} -m ${ADMIN_EMAIL} --agree-tos --non-interactive
+# SSL
+certbot certonly --nginx -d $ADMINPANEL --agree-tos --non-interactive -m $EMAIL
+sed -i "s|listen 80;|listen 443 ssl;|" /etc/nginx/sites-available/postfixadmin.conf
+sed -i "/server_name/a \    ssl_certificate /etc/letsencrypt/live/$ADMINPANEL/fullchain.pem;\n    ssl_certificate_key /etc/letsencrypt/live/$ADMINPANEL/privkey.pem;" /etc/nginx/sites-available/postfixadmin.conf
+nginx -t && systemctl reload nginx
 
-### Configure Postfix for virtual domains ###
-postconf -e "home_mailbox = Maildir/"
-postconf -e "virtual_mailbox_domains = mysql:/etc/postfix/mysql-virtual-domains.cf"
-postconf -e "virtual_mailbox_maps = mysql:/etc/postfix/mysql-virtual-mailboxes.cf"
-postconf -e "virtual_alias_maps = mysql:/etc/postfix/mysql-virtual-aliases.cf"
+# === POSTFIX / DOVECOT SQL BACKEND CONFIG ===
+# Postfix SQL maps
+mkdir -p /etc/postfix/sql
+cat > /etc/postfix/sql/mysql-virtual-mailbox-domains.cf <<EOF
+user = mailuser
+password = mailpass
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT domain FROM domain WHERE domain='%s'
+EOF
+
+cat > /etc/postfix/sql/mysql-virtual-mailbox-maps.cf <<EOF
+user = mailuser
+password = mailpass
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT maildir FROM mailbox WHERE username='%s'
+EOF
+
+cat > /etc/postfix/sql/mysql-virtual-alias-maps.cf <<EOF
+user = mailuser
+password = mailpass
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT goto FROM alias WHERE address='%s'
+EOF
+
+postconf -e "virtual_mailbox_domains = mysql:/etc/postfix/sql/mysql-virtual-mailbox-domains.cf"
+postconf -e "virtual_mailbox_maps = mysql:/etc/postfix/sql/mysql-virtual-mailbox-maps.cf"
+postconf -e "virtual_alias_maps = mysql:/etc/postfix/sql/mysql-virtual-alias-maps.cf"
 postconf -e "virtual_transport = lmtp:unix:private/dovecot-lmtp"
 
-### Enable Dovecot SQL auth ###
+# Dovecot SQL config
 cat > /etc/dovecot/dovecot-sql.conf.ext <<EOF
 driver = mysql
-connect = host=localhost dbname=postfixadmin user=postfixadmin password=${DB_PASS}
-default_pass_scheme = MD5-CRYPT
-password_query = SELECT username AS user, password, domain FROM mailbox WHERE username='%u';
+connect = host=127.0.0.1 dbname=mailserver user=mailuser password=mailpass
+default_pass_scheme = SHA512-CRYPT
+password_query = SELECT username as user, password FROM mailbox WHERE username='%u' AND active='1'
+user_query = SELECT maildir AS home, 5000 AS uid, 5000 AS gid FROM mailbox WHERE username='%u' AND active='1'
 EOF
 
-sed -i "s/#disable_plaintext_auth = yes/disable_plaintext_auth = yes/" /etc/dovecot/conf.d/10-auth.conf
-sed -i "s/auth-system.conf.ext/auth-sql.conf.ext/" /etc/dovecot/conf.d/10-auth.conf
-sed -i "s|mail_location =.*|mail_location = maildir:/var/vmail/%d/%n/Maildir|" /etc/dovecot/conf.d/10-mail.conf
-mkdir -p /var/vmail && chown -R vmail:vmail /var/vmail
+# Create vmail user
+groupadd -g 5000 vmail
+useradd -g vmail -u 5000 vmail -d /var/mail
 
-### Install PostfixAdmin Stats Plugin ###
-cd /var/www/postfixadmin/plugins
-git clone https://github.com/postfixadmin/postfixadmin-stats stats
-cd stats
-composer install --no-dev
-chown -R www-data:www-data /var/www/postfixadmin/plugins
+# Update Dovecot config
+sed -i "s|^#mail_location =.*|mail_location = maildir:/var/mail/%d/%n/Maildir|" /etc/dovecot/conf.d/10-mail.conf
+sed -i "s|^auth_mechanisms =.*|auth_mechanisms = plain login|" /etc/dovecot/conf.d/10-auth.conf
+sed -i "s|^!include auth-system.conf.ext|#!include auth-system.conf.ext|" /etc/dovecot/conf.d/10-auth.conf
+sed -i "s|^#!include auth-sql.conf.ext|!include auth-sql.conf.ext|" /etc/dovecot/conf.d/10-auth.conf
 
-### Setup maillog2sql ###
-cd /usr/local/bin
-wget https://raw.githubusercontent.com/postfixadmin/postfixadmin/master/ADDITIONS/logging/maillog2sql
-chmod +x maillog2sql
+systemctl restart postfix dovecot nginx mariadb
 
-mysql -u root postfixadmin < /var/www/postfixadmin/ADDITIONS/logging/maillog2sql.mysql
-
-cat > /etc/maillog2sql.conf <<EOF
-DBHOST=localhost
-DBNAME=postfixadmin
-DBUSER=postfixadmin
-DBPASS=${DB_PASS}
-TABLE=maillog
+# === AUTO RENEW ===
+cat > /etc/cron.d/certbot-renew <<EOF
+0 3 * * * root certbot renew --quiet --post-hook "systemctl reload postfix dovecot nginx"
 EOF
 
-### Cron for live stats (every 5 min) ###
-echo "*/5 * * * * root /usr/local/bin/maillog2sql -f /var/log/mail.log -c /etc/maillog2sql.conf" >> /etc/crontab
-
-### Daily summary email ###
-echo "0 1 * * * root pflogsumm /var/log/mail.log | mail -s 'Daily Mail Report' ${ADMIN_EMAIL}" >> /etc/crontab
-
-### Restart services ###
-systemctl restart postfix dovecot apache2 bind9
+echo "========================================================="
+echo "Setup complete!"
+echo "Webmail: https://$WEBMAIL/"
+echo "Admin Console: https://$ADMINPANEL/  (setup password: setup123)"
+echo "Login with PostfixAdmin, add domain ($DOMAIN), then create mailboxes."
+echo "Users will authenticate via database, not system accounts."
+echo "========================================================="
