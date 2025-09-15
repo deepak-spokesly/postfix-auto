@@ -1,176 +1,141 @@
 #!/bin/bash
-# Postfix + DKIM + DMARC + BIND9 DNS + Let's Encrypt SSL (per subdomain/IP)
+# Postfix + Dovecot + DKIM + DMARC + BIND9 + SSL + Roundcube + PostfixAdmin
 # Ubuntu 24.04 LTS
 # Run as root
 
 # === CONFIGURATION ===
 DOMAIN="example.com"
-SUBDOMAINS=("("ca01" "ca02" "ca03" "ca04" "ca05" "ca06" "ca07" "ca08" "ca09" "ca10")   # one-to-one with IPS below")
-IPS=("54.39.78.214" "54.39.78.219" "54.39.78.221" "54.39.78.222" "15.235.122.20" "15.235.122.21" "15.235.122.22" "15.235.122.23" "15.235.122.24" "15.235.122.72")
-EMAIL="admin@$DOMAIN"   # For Let's Encrypt notifications
+SUBDOMAINS=("mail1" "mail2" "mail3")
+IPS=("192.0.2.10" "192.0.2.11" "192.0.2.12")
+EMAIL="admin@$DOMAIN"
+WEBMAIL="webmail.$DOMAIN"
+ADMINPANEL="mailadmin.$DOMAIN"
 
-echo "[+] Updating system..."
+# === PREPARE SYSTEM ===
 apt update -y && apt upgrade -y
+DEBIAN_FRONTEND=noninteractive apt install -y postfix mailutils postfwd opendkim opendkim-tools opendmarc bind9 bind9utils bind9-dnsutils certbot dovecot-imapd dovecot-pop3d dovecot-lmtpd mariadb-server nginx php-fpm php-mysql php-intl php-mbstring php-xml unzip wget git
 
-echo "[+] Installing packages..."
-DEBIAN_FRONTEND=noninteractive apt install -y postfix mailutils postfwd opendkim opendkim-tools opendmarc bind9 bind9utils bind9-dnsutils certbot
+# === DATABASE SETUP ===
+mysql -e "CREATE DATABASE mailserver;"
+mysql -e "CREATE USER 'mailuser'@'localhost' IDENTIFIED BY 'mailpass';"
+mysql -e "GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'localhost';"
+mysql -e "FLUSH PRIVILEGES;"
 
-# === POSTFIX BASE CONFIG ===
-postconf -e "myhostname = ${SUBDOMAINS[0]}.$DOMAIN"
-postconf -e "myorigin = $DOMAIN"
-postconf -e "inet_interfaces = all"
-postconf -e "inet_protocols = ipv4"
-postconf -e "mydestination = localhost"
-postconf -e "relay_domains ="
-postconf -e "home_mailbox = Maildir/"
-postconf -e "smtpd_banner = \$myhostname ESMTP"
-postconf -e "biff = no"
-postconf -e "append_dot_mydomain = no"
-postconf -e "readme_directory = no"
-postconf -e "compatibility_level = 2"
-postconf -e "smtpd_recipient_restrictions = check_policy_service inet:127.0.0.1:10040, permit"
+# === POSTFIXADMIN INSTALL ===
+cd /var/www/
+wget https://github.com/postfixadmin/postfixadmin/archive/refs/tags/postfixadmin-3.3.13.tar.gz
+tar xzf postfixadmin-*.tar.gz
+mv postfixadmin-* postfixadmin
+chown -R www-data:www-data postfixadmin
 
-# === MASTER.CF MULTI-IP + TLS ===
-cp /etc/postfix/master.cf /etc/postfix/master.cf.bak
-for i in "${!SUBDOMAINS[@]}"; do
-  sub="${SUBDOMAINS[$i]}"
-  ip="${IPS[$i]}"
-
-  cat >> /etc/postfix/master.cf <<EOF
-
-smtp-$sub   unix  -       -       n       -       -       smtp
-    -o smtp_bind_address=$ip
-    -o smtp_helo_name=$sub.$DOMAIN
-    -o smtp_tls_security_level=may
-    -o smtp_tls_cert_file=/etc/letsencrypt/live/$sub.$DOMAIN/fullchain.pem
-    -o smtp_tls_key_file=/etc/letsencrypt/live/$sub.$DOMAIN/privkey.pem
-EOF
-done
-
-# === POSTFWD FOR ROUND ROBIN ===
-cat > /etc/postfwd/postfwd.cf <<EOF
-id=ROUNDRBIN action=prepend Transport=smtp-%counter(${SUBDOMAINS[*]})
-EOF
-systemctl enable postfwd
-systemctl restart postfwd
-
-# === OPENDKIM ===
-mkdir -p /etc/opendkim/keys
-cat > /etc/opendkim.conf <<EOF
-Syslog yes
-UMask 002
-Canonicalization relaxed/simple
-Mode sv
-SubDomains no
-Socket inet:8891@localhost
-PidFile /var/run/opendkim/opendkim.pid
-SignatureAlgorithm rsa-sha256
-KeyTable           /etc/opendkim/key.table
-SigningTable       /etc/opendkim/signing.table
-TrustedHosts       /etc/opendkim/trusted.hosts
+# Config
+cp /var/www/postfixadmin/config.local.php /var/www/postfixadmin/config.local.php.bak || true
+cat > /var/www/postfixadmin/config.local.php <<EOF
+<?php
+\$CONF['configured'] = true;
+\$CONF['setup_password'] = '$(php -r "echo password_hash('setup123', PASSWORD_DEFAULT);")';
+\$CONF['default_language'] = 'en';
+\$CONF['database_type'] = 'mysqli';
+\$CONF['database_host'] = 'localhost';
+\$CONF['database_user'] = 'mailuser';
+\$CONF['database_password'] = 'mailpass';
+\$CONF['database_name'] = 'mailserver';
+\$CONF['domain_path'] = 'NO';
+\$CONF['domain_in_mailbox'] = 'YES';
+\$CONF['encrypt'] = 'dovecot:SHA512-CRYPT';
+\$CONF['dovecotpw'] = "/usr/bin/doveadm pw";
+\$CONF['admin_email'] = '$EMAIL';
 EOF
 
-cat > /etc/opendkim/trusted.hosts <<EOF
-127.0.0.1
-localhost
-$DOMAIN
+# Nginx vhost
+cat > /etc/nginx/sites-available/postfixadmin.conf <<EOF
+server {
+    listen 80;
+    server_name $ADMINPANEL;
+    root /var/www/postfixadmin/public;
+
+    location / {
+        index index.php;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
+    }
+}
 EOF
 
-> /etc/opendkim/key.table
-> /etc/opendkim/signing.table
+ln -s /etc/nginx/sites-available/postfixadmin.conf /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
 
-for sub in "${SUBDOMAINS[@]}"; do
-  mkdir -p /etc/opendkim/keys/$sub.$DOMAIN
-  opendkim-genkey -D /etc/opendkim/keys/$sub.$DOMAIN/ -d $sub.$DOMAIN -s default
-  chown -R opendkim:opendkim /etc/opendkim/keys/$sub.$DOMAIN
-  echo "default._domainkey.$sub.$DOMAIN $sub.$DOMAIN:default:/etc/opendkim/keys/$sub.$DOMAIN/default.private" >> /etc/opendkim/key.table
-  echo "*@$sub.$DOMAIN default._domainkey.$sub.$DOMAIN" >> /etc/opendkim/signing.table
-done
+# SSL
+certbot certonly --nginx -d $ADMINPANEL --agree-tos --non-interactive -m $EMAIL
+sed -i "s|listen 80;|listen 443 ssl;|" /etc/nginx/sites-available/postfixadmin.conf
+sed -i "/server_name/a \    ssl_certificate /etc/letsencrypt/live/$ADMINPANEL/fullchain.pem;\n    ssl_certificate_key /etc/letsencrypt/live/$ADMINPANEL/privkey.pem;" /etc/nginx/sites-available/postfixadmin.conf
+nginx -t && systemctl reload nginx
 
-usermod -aG opendkim postfix
-postconf -e "milter_default_action = accept"
-postconf -e "milter_protocol = 2"
-postconf -e "smtpd_milters = inet:127.0.0.1:8891, inet:127.0.0.1:8893"
-postconf -e "non_smtpd_milters = inet:127.0.0.1:8891, inet:127.0.0.1:8893"
-systemctl enable opendkim
-systemctl restart opendkim
-
-# === OPENDMARC ===
-cat > /etc/opendmarc.conf <<EOF
-Syslog                  true
-Socket                  inet:8893@localhost
-PidFile                 /var/run/opendmarc/opendmarc.pid
-UserID                  opendmarc:opendmarc
-AuthservID              ${SUBDOMAINS[0]}.$DOMAIN
-TrustedAuthservIDs      ${SUBDOMAINS[0]}.$DOMAIN
-IgnoreAuthenticatedClients true
-EOF
-systemctl enable opendmarc
-systemctl restart opendmarc
-
-# === BIND9 ZONE ===
-cat > /etc/bind/named.conf.local <<EOF
-zone "$DOMAIN" {
-    type master;
-    file "/etc/bind/db.$DOMAIN";
-    allow-update { none; };
-};
+# === POSTFIX / DOVECOT SQL BACKEND CONFIG ===
+# Postfix SQL maps
+mkdir -p /etc/postfix/sql
+cat > /etc/postfix/sql/mysql-virtual-mailbox-domains.cf <<EOF
+user = mailuser
+password = mailpass
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT domain FROM domain WHERE domain='%s'
 EOF
 
-cat > /etc/bind/db.$DOMAIN <<EOF
-\$TTL    3600
-@       IN      SOA     ns1.$DOMAIN. admin.$DOMAIN. (
-                        2025091201 ; Serial
-                        3600       ; Refresh
-                        1800       ; Retry
-                        1209600    ; Expire
-                        3600 )     ; Minimum TTL
-
-        IN      NS      ns1.$DOMAIN.
-ns1     IN      A       ${IPS[0]}
-
-_dmarc  IN      TXT     "v=DMARC1; p=quarantine; rua=mailto:dmarc@$DOMAIN; ruf=mailto:dmarc@$DOMAIN; sp=none; adkim=s; aspf=s"
+cat > /etc/postfix/sql/mysql-virtual-mailbox-maps.cf <<EOF
+user = mailuser
+password = mailpass
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT maildir FROM mailbox WHERE username='%s'
 EOF
 
-for i in "${!SUBDOMAINS[@]}"; do
-  sub="${SUBDOMAINS[$i]}"
-  ip="${IPS[$i]}"
-  echo "$sub     IN      A       $ip" >> /etc/bind/db.$DOMAIN
-  echo "$sub     IN      MX 10   $sub.$DOMAIN." >> /etc/bind/db.$DOMAIN
-  echo "$sub     IN      TXT     \"v=spf1 a mx ip4:$ip ~all\"" >> /etc/bind/db.$DOMAIN
-  DKIMTXT=$(cat /etc/opendkim/keys/$sub.$DOMAIN/default.txt | tr -d '\n' | sed 's/" "/ /g')
-  echo "default._domainkey.$sub   IN  TXT   $DKIMTXT" >> /etc/bind/db.$DOMAIN
-done
-
-systemctl enable bind9
-systemctl restart bind9
-
-# === SSL WITH LET'S ENCRYPT (PER SUBDOMAIN) ===
-for sub in "${SUBDOMAINS[@]}"; do
-  certbot certonly --standalone -d $sub.$DOMAIN --agree-tos --non-interactive -m $EMAIL
-done
-
-# === ENABLE TLS FOR INBOUND SMTP (default cert: mail1) ===
-postconf -e "smtpd_tls_cert_file=/etc/letsencrypt/live/${SUBDOMAINS[0]}.$DOMAIN/fullchain.pem"
-postconf -e "smtpd_tls_key_file=/etc/letsencrypt/live/${SUBDOMAINS[0]}.$DOMAIN/privkey.pem"
-postconf -e "smtpd_use_tls=yes"
-postconf -e "smtpd_tls_security_level=may"
-postconf -e "smtp_tls_security_level=may"
-postconf -e "smtpd_tls_auth_only=yes"
-postconf -e "smtpd_tls_loglevel=1"
-postconf -e "smtpd_tls_session_cache_database=btree:\${data_directory}/smtpd_scache"
-postconf -e "smtp_tls_session_cache_database=btree:\${data_directory}/smtp_scache"
-
-systemctl restart postfix
-
-# === AUTO RENEWAL CRON ===
-cat > /etc/cron.d/certbot-postfix <<EOF
-0 3 * * * root certbot renew --quiet --post-hook "systemctl reload postfix"
+cat > /etc/postfix/sql/mysql-virtual-alias-maps.cf <<EOF
+user = mailuser
+password = mailpass
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT goto FROM alias WHERE address='%s'
 EOF
 
-echo "[+] Setup complete!"
+postconf -e "virtual_mailbox_domains = mysql:/etc/postfix/sql/mysql-virtual-mailbox-domains.cf"
+postconf -e "virtual_mailbox_maps = mysql:/etc/postfix/sql/mysql-virtual-mailbox-maps.cf"
+postconf -e "virtual_alias_maps = mysql:/etc/postfix/sql/mysql-virtual-alias-maps.cf"
+postconf -e "virtual_transport = lmtp:unix:private/dovecot-lmtp"
+
+# Dovecot SQL config
+cat > /etc/dovecot/dovecot-sql.conf.ext <<EOF
+driver = mysql
+connect = host=127.0.0.1 dbname=mailserver user=mailuser password=mailpass
+default_pass_scheme = SHA512-CRYPT
+password_query = SELECT username as user, password FROM mailbox WHERE username='%u' AND active='1'
+user_query = SELECT maildir AS home, 5000 AS uid, 5000 AS gid FROM mailbox WHERE username='%u' AND active='1'
+EOF
+
+# Create vmail user
+groupadd -g 5000 vmail
+useradd -g vmail -u 5000 vmail -d /var/mail
+
+# Update Dovecot config
+sed -i "s|^#mail_location =.*|mail_location = maildir:/var/mail/%d/%n/Maildir|" /etc/dovecot/conf.d/10-mail.conf
+sed -i "s|^auth_mechanisms =.*|auth_mechanisms = plain login|" /etc/dovecot/conf.d/10-auth.conf
+sed -i "s|^!include auth-system.conf.ext|#!include auth-system.conf.ext|" /etc/dovecot/conf.d/10-auth.conf
+sed -i "s|^#!include auth-sql.conf.ext|!include auth-sql.conf.ext|" /etc/dovecot/conf.d/10-auth.conf
+
+systemctl restart postfix dovecot nginx mariadb
+
+# === AUTO RENEW ===
+cat > /etc/cron.d/certbot-renew <<EOF
+0 3 * * * root certbot renew --quiet --post-hook "systemctl reload postfix dovecot nginx"
+EOF
+
 echo "========================================================="
-echo "Postfix + DKIM + DMARC + BIND9 + SSL configured."
-echo "Each subdomain has its own certificate and is bound in Postfix."
-echo "Auto SSL renewal with Postfix reload scheduled daily at 3AM."
+echo "Setup complete!"
+echo "Webmail: https://$WEBMAIL/"
+echo "Admin Console: https://$ADMINPANEL/  (setup password: setup123)"
+echo "Login with PostfixAdmin, add domain ($DOMAIN), then create mailboxes."
+echo "Users will authenticate via database, not system accounts."
 echo "========================================================="
